@@ -1,0 +1,10 @@
+[package]
+name = "st-dot-toolbox-tokenizer"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tiktoken-rs.workspace = true
