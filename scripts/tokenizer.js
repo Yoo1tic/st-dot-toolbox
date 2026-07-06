@@ -4,10 +4,25 @@ import init, {
 	try_count_messages,
 	try_encode_text,
 } from "../pkg/st_dot_toolbox.js";
-import { createLogger } from "./logger.js";
+import { createLogger, setLogLevel } from "./logger.js";
 import { patchOnce } from "./patching.js";
 
 const logger = createLogger("tokenizer");
+
+/** Logs, at debug, a locally served request with its model and token count. */
+function logSuccess(op, model, tokenCount) {
+	logger.debug(`${op} ok: "${model || "unknown"}" → ${tokenCount} tokens.`);
+}
+
+/**
+ * Logs, at debug, that a request was delegated to SillyTavern's backend.
+ *
+ * Unsupported models fall through to the original path by design; this makes the
+ * reason visible when debug is enabled, without affecting the info stream.
+ */
+function logFallback(op, model) {
+	logger.debug(`"${model || "unknown"}" not handled locally (${op}); using backend.`);
+}
 
 const LOCAL_TOKENIZER_ROUTES = Object.freeze({
 	count: "/api/tokenizers/openai/count",
@@ -44,6 +59,8 @@ async function installTokenizerInner() {
 	await init();
 	installEndpointFallbacks();
 	await installTokenHandlerFastPath();
+	// Live verbosity toggle for field debugging, e.g. __stDotToolbox.setLogLevel("debug").
+	window.__stDotToolbox = { setLogLevel };
 	logger.info("local WASM tokenizer active.");
 }
 
@@ -108,6 +125,11 @@ function tryBuildTokenizerResponse({ op, model }, bodyText) {
 	return try_encode_text(model, readEncodeTextBody(bodyText));
 }
 
+/** Token count carried by a local response, for either operation. */
+function payloadTokenCount(op, payload) {
+	return op === "count" ? payload.token_count : payload.count;
+}
+
 function readFetchUrl(input) {
 	if (typeof input === "string") return input;
 	if (input instanceof URL) return input.href;
@@ -148,8 +170,16 @@ function installFetchFallback() {
 					// through to the original backend request.
 					if (typeof body === "string") {
 						const payload = tryBuildTokenizerResponse(target, body);
-						if (payload) return Response.json(payload);
+						if (payload) {
+							logSuccess(
+								target.op,
+								target.model,
+								payloadTokenCount(target.op, payload),
+							);
+							return Response.json(payload);
+						}
 					}
+					logFallback(target.op, target.model);
 				}
 			} catch (error) {
 				logger.error("fetch intercept failed, falling back to backend:", error);
@@ -203,7 +233,15 @@ function installJQueryFallback($) {
 						target,
 						readAjaxBody(request),
 					);
-					if (payload) return resolveAjaxLocally($, request, payload);
+					if (payload) {
+						logSuccess(
+							target.op,
+							target.model,
+							payloadTokenCount(target.op, payload),
+						);
+						return resolveAjaxLocally($, request, payload);
+					}
+					logFallback(target.op, target.model);
 				}
 			} catch (error) {
 				logger.error(
@@ -244,17 +282,12 @@ async function installTokenHandlerFastPath() {
 								: [messages];
 							const bodyText = JSON.stringify(messagesArray);
 
-							let token_count = try_count_messages(model, bodyText);
+							const token_count = try_count_messages(model, bodyText);
 							if (token_count === undefined) {
+								logFallback("count", model);
 								return originalCountAsync.call(this, messages, full, type);
 							}
-
-							// Rust returns the batch token count only. ST's original async counter
-							// subtracts this non-full adjustment after counting, so keep that
-							// UI/budget convention while avoiding its per-message backend cache path.
-							if (!full) {
-								token_count -= 2;
-							}
+							logSuccess("count", model, token_count);
 
 							// ST often calls countAsync without a bucket type. The original method
 							// creates a NaN `undefined` bucket; skip that bookkeeping noise here.
