@@ -33,6 +33,5 @@ pub fn try_encode_text(model: &str, text: &str) -> Result<JsValue, JsError> {
 /// Runs on module init for readable panic messages in the browser console.
 #[wasm_bindgen(start)]
 pub fn start() {
-    #[cfg(feature = "console_error_panic_hook")]
     console_error_panic_hook::set_once();
 }
