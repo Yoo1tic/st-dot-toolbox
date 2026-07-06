@@ -16,6 +16,25 @@ pub fn try_count_messages(model: &str, body_json: &str) -> Result<Option<usize>,
         .map_err(|error| JsError::new(&error.to_string()))
 }
 
+/// Initialize the lazy Gemma/Gemini-family tokenizer from a tokenizer JSON asset.
+#[wasm_bindgen]
+pub fn init_gemma_tokenizer(tokenizer_json: &str) -> Result<(), JsError> {
+    tokenizer::init_gemma_tokenizer(tokenizer_json)
+        .map_err(|error| JsError::new(&error.to_string()))
+}
+
+/// Return whether the Gemma/Gemini-family tokenizer has been initialized.
+#[wasm_bindgen]
+pub fn is_gemma_tokenizer_initialized() -> bool {
+    tokenizer::is_gemma_tokenizer_initialized()
+}
+
+/// Try to count plain text with a locally initialized tokenizer.
+#[wasm_bindgen]
+pub fn try_count_text(model: &str, text: &str) -> Result<Option<usize>, JsError> {
+    tokenizer::try_count_text(model, text).map_err(|error| JsError::new(&error.to_string()))
+}
+
 /// Try to encode text locally.
 ///
 /// Returns `{ ids, count, chunks }` on success, `null` for unsupported models,

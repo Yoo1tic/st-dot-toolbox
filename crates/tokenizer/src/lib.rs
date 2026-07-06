@@ -6,6 +6,7 @@
 mod chat;
 mod encode;
 mod error;
+mod gemma;
 
 pub use encode::EncodeResult;
 pub use error::TokenizerError;
@@ -17,6 +18,10 @@ pub use error::TokenizerError;
 /// tool calls. `Ok(None)` means the model is unsupported locally and callers
 /// should fall back to SillyTavern's original tokenizer path.
 pub fn try_count_messages(model: &str, body_json: &str) -> Result<Option<usize>, TokenizerError> {
+    if gemma::supports_model(model) {
+        return Ok(None);
+    }
+
     match chat::count(model, body_json) {
         Ok(count) => Ok(Some(count)),
         Err(error) if error.is_unsupported_model() => Ok(None),
@@ -30,7 +35,26 @@ pub fn try_count_messages(model: &str, body_json: &str) -> Result<Option<usize>,
 /// the model is unknown to `tiktoken-rs` and callers should fall back to their
 /// original tokenizer path.
 pub fn try_encode_text(model: &str, text: &str) -> Result<Option<EncodeResult>, TokenizerError> {
+    if let Some(result) = gemma::encode_text(model, text)? {
+        return Ok(Some(result));
+    }
+
     encode::encode_text(model, text)
+}
+
+/// Initializes the lazy Gemma/Gemini-family tokenizer from `tokenizer.json`.
+pub fn init_gemma_tokenizer(tokenizer_json: &str) -> Result<(), TokenizerError> {
+    gemma::init_tokenizer(tokenizer_json)
+}
+
+/// Returns whether the Gemma/Gemini-family tokenizer is ready for local use.
+pub fn is_gemma_tokenizer_initialized() -> bool {
+    gemma::is_initialized()
+}
+
+/// Counts plain text with the Gemma/Gemini-family tokenizer when available.
+pub fn try_count_text(model: &str, text: &str) -> Result<Option<usize>, TokenizerError> {
+    gemma::count_text(model, text)
 }
 
 #[cfg(test)]
