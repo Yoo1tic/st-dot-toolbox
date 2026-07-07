@@ -3,11 +3,15 @@
 use serde::Deserialize;
 use tiktoken_rs::{ChatCompletionRequestMessage, FunctionCall, num_tokens_from_messages};
 
-use crate::TokenizerError;
+use crate::{CountTokenRequest, TokenizerError};
 
-pub(crate) fn count(model: &str, body_json: &str) -> Result<usize, TokenizerError> {
-    let raw_messages: Vec<RawChatMessage> = serde_json::from_str(body_json)?;
-    let messages = raw_messages
+/// Counts provider-agnostic messages by adapting them into OpenAI messages.
+///
+/// This is where the OpenAI provider owns its own conversion: the neutral
+/// [`CountTokenRequest`] value is deserialized into the OpenAI request shape here,
+/// so the crate-level entry point stays free of `tiktoken-rs`-specific types.
+pub(crate) fn count(model: &str, messages: CountTokenRequest) -> Result<usize, TokenizerError> {
+    let messages = serde_json::from_value::<Vec<RawChatMessage>>(messages.into_value())?
         .into_iter()
         .map(ChatCompletionRequestMessage::try_from)
         .collect::<Result<Vec<_>, _>>()?;
@@ -152,10 +156,13 @@ impl TryFrom<RawChatMessage> for ChatCompletionRequestMessage {
 mod tests {
     use super::*;
 
+    fn messages(json: &str) -> CountTokenRequest {
+        serde_json::from_str(json).expect("test body should be valid JSON")
+    }
+
     #[test]
-    fn invalid_body_is_an_error() {
-        assert!(count("gpt-4o", "not json").is_err());
-        assert!(count("gpt-4o", r#"{"role":"user"}"#).is_err());
-        assert!(count("gpt-4o", r#"[{"content":"hi"}]"#).is_err());
+    fn invalid_message_shapes_are_an_error() {
+        assert!(count("gpt-4o", messages(r#"{"role":"user"}"#)).is_err());
+        assert!(count("gpt-4o", messages(r#"[{"content":"hi"}]"#)).is_err());
     }
 }
