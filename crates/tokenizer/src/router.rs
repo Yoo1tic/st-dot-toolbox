@@ -33,15 +33,21 @@ impl TokenizerProvider {
         OpenAiTokenizer::from_model_name(model).map(Self::OpenAi)
     }
 
+    /// Derives a provider from a model name, falling back to the heuristic
+    /// estimator when no exact local tokenizer claims the model.
+    pub(crate) fn from_model_name_or_fallback(model: &ModelName) -> Self {
+        Self::from_model_name(model).unwrap_or(Self::Fallback(FallbackTokenizer))
+    }
+
     pub(crate) fn count(
         &self,
         model: ModelName,
         messages: CountTokenRequest,
     ) -> Result<CountResult, TokenizerError> {
         match self {
-            Self::OpenAi(tokenizer) => tokenizer.count(model, messages),
-            Self::Gemma(tokenizer) => tokenizer.count(model, messages),
-            Self::Fallback(tokenizer) => tokenizer.count(model, messages),
+            Self::OpenAi(tokenizer) => tokenizer_countor(tokenizer, model, messages),
+            Self::Gemma(tokenizer) => tokenizer_countor(tokenizer, model, messages),
+            Self::Fallback(tokenizer) => tokenizer_countor(tokenizer, model, messages),
         }
     }
 
@@ -49,7 +55,7 @@ impl TokenizerProvider {
         &self,
         model: ModelName,
         text: &str,
-    ) -> Result<Option<EncodeResult>, TokenizerError> {
+    ) -> Result<EncodeResult, TokenizerError> {
         match self {
             Self::OpenAi(tokenizer) => tokenizer.encode(model, text),
             Self::Gemma(tokenizer) => tokenizer.encode(model, text),
@@ -58,11 +64,7 @@ impl TokenizerProvider {
     }
 
     /// Decodes token ids with the selected provider tokenizer.
-    pub fn decode(
-        &self,
-        model: ModelName,
-        ids: &[u32],
-    ) -> Result<Option<DecodeResult>, TokenizerError> {
+    pub fn decode(&self, model: ModelName, ids: &[u32]) -> Result<DecodeResult, TokenizerError> {
         match self {
             Self::OpenAi(tokenizer) => tokenizer.decode(model, ids),
             Self::Gemma(tokenizer) => tokenizer.decode(model, ids),
@@ -109,11 +111,30 @@ pub trait Tokenizer {
     ) -> Result<CountResult, TokenizerError>;
 
     /// Encodes text into token ids and token chunks.
-    fn encode(&self, model: ModelName, text: &str) -> Result<Option<EncodeResult>, TokenizerError>;
+    fn encode(&self, model: ModelName, text: &str) -> Result<EncodeResult, TokenizerError>;
 
     /// Decodes token ids into text. Reserved for a future decode endpoint.
-    fn decode(&self, model: ModelName, ids: &[u32])
-    -> Result<Option<DecodeResult>, TokenizerError>;
+    fn decode(&self, model: ModelName, ids: &[u32]) -> Result<DecodeResult, TokenizerError>;
+}
+
+pub(crate) fn tokenizer_countor<T>(
+    tokenizer: &T,
+    model: ModelName,
+    text: CountTokenRequest,
+) -> Result<CountResult, TokenizerError>
+where
+    T: Tokenizer + ?Sized,
+{
+    let fallback_model = model.clone();
+    let fallback_text = text.clone();
+
+    tokenizer.count(model, text).or_else(|error| {
+        if error.should_estimate_count() {
+            FallbackTokenizer.count(fallback_model, fallback_text)
+        } else {
+            Err(error)
+        }
+    })
 }
 
 /// Derives a tokenizer provider from a model-name value.
@@ -151,7 +172,7 @@ impl TokenizerAsset {
     pub(crate) fn from_id(asset_id: &str) -> Result<Self, TokenizerError> {
         match asset_id {
             "gemma" => Ok(Self::Gemma),
-            other => Err(TokenizerError::Tokenizer(format!(
+            other => Err(TokenizerError::Unsupported(format!(
                 "unknown tokenizer asset `{other}`"
             ))),
         }

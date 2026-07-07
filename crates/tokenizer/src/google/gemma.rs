@@ -92,7 +92,7 @@ impl Tokenizer for GemmaTokenizer {
         let text = flatten_messages(messages)?;
         let encoding = tokenizer
             .encode_fast(text, false)
-            .map_err(|error| TokenizerError::Tokenizer(error.to_string()))?;
+            .map_err(|error| TokenizerError::HuggingfaceTokenizer(error.to_string()))?;
 
         Ok(CountResult {
             token_count: encoding.len(),
@@ -101,32 +101,31 @@ impl Tokenizer for GemmaTokenizer {
         })
     }
 
-    fn encode(&self, model: ModelName, text: &str) -> Result<Option<EncodeResult>, TokenizerError> {
+    fn encode(&self, model: ModelName, text: &str) -> Result<EncodeResult, TokenizerError> {
         let Some(tokenizer) = self.get_tokenizer() else {
             return Err(TokenizerError::UnInitialized(Self::LABEL));
         };
 
         let encoding = tokenizer
             .encode_fast(text, false)
-            .map_err(|error| TokenizerError::Tokenizer(error.to_string()))?;
+            .map_err(|error| TokenizerError::HuggingfaceTokenizer(error.to_string()))?;
         let ids = encoding.get_ids().to_vec();
         let chunks = encoding.get_tokens().to_vec();
 
-        Ok(Some(EncodeResult {
+        Ok(EncodeResult {
             count: ids.len(),
             ids,
             chunks,
             model_name: model,
             label: Self::LABEL,
-        }))
+        })
     }
 
-    fn decode(
-        &self,
-        _model: ModelName,
-        _ids: &[u32],
-    ) -> Result<Option<DecodeResult>, TokenizerError> {
-        Ok(None)
+    fn decode(&self, model: ModelName, _ids: &[u32]) -> Result<DecodeResult, TokenizerError> {
+        Err(TokenizerError::Unsupported(format!(
+            "model `{}` is not handled by the local decoder",
+            model.as_str()
+        )))
     }
 }
 
@@ -140,7 +139,7 @@ pub fn init_tokenizer(tokenizer_json: &str) -> Result<(), TokenizerError> {
     }
 
     let tokenizer = HuggingFaceTokenizer::from_bytes(tokenizer_json.as_bytes())
-        .map_err(|error| TokenizerError::Tokenizer(error.to_string()))?;
+        .map_err(|error| TokenizerError::HuggingfaceTokenizer(error.to_string()))?;
     let _ = GEMMA_TOKENIZER.set(tokenizer);
     Ok(())
 }

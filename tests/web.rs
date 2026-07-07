@@ -46,15 +46,28 @@ fn count_chat_messages_counts_a_live_array() {
 
 #[wasm_bindgen_test]
 fn count_messages_rejects_invalid_json() {
-    assert!(try_count_messages("gpt-4o", "not json").is_err());
+    match try_count_messages("gpt-4o", "not json") {
+        Ok(value) if value.is_object() => {
+            let error: serde_json::Value =
+                serde_wasm_bindgen::from_value(value).expect("error should deserialize");
+            assert_eq!(error["error_type"], "Json");
+        }
+        Ok(value) => panic!("invalid JSON should return an error object, got {value:?}"),
+        Err(error) => panic!("invalid JSON should not throw: {error:?}"),
+    }
 }
 
 #[wasm_bindgen_test]
 fn unsupported_models_are_reported() {
-    assert!(matches!(
-        try_encode_text("qwen2", "hello"),
-        Ok(value) if value.is_null()
-    ));
+    match try_encode_text("qwen2", "hello") {
+        Ok(value) if value.is_object() => {
+            let error: serde_json::Value =
+                serde_wasm_bindgen::from_value(value).expect("error should deserialize");
+            assert_eq!(error["error_type"], "Unsupported");
+        }
+        Ok(value) => panic!("unsupported model should return an error object, got {value:?}"),
+        Err(error) => panic!("unsupported model should not throw: {error:?}"),
+    }
 }
 
 #[wasm_bindgen_test]
@@ -94,5 +107,8 @@ fn tokenizer_asset_selection_lives_in_rust() {
             .as_deref(),
         Some("gemma")
     );
-    assert!(tokenizer_asset_for_model("gpt-4o").is_null());
+    assert_eq!(
+        tokenizer_asset_for_model("gpt-4o").as_string().as_deref(),
+        Some("")
+    );
 }

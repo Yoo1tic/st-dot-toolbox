@@ -51,20 +51,18 @@ impl Tokenizer for FallbackTokenizer {
         Ok(self.estimate(model, &messages.into_value().to_string()))
     }
 
-    fn encode(
-        &self,
-        _model: ModelName,
-        _text: &str,
-    ) -> Result<Option<EncodeResult>, TokenizerError> {
-        Ok(None)
+    fn encode(&self, model: ModelName, _text: &str) -> Result<EncodeResult, TokenizerError> {
+        Err(TokenizerError::Unsupported(format!(
+            "model `{}` is not handled by the local encoder",
+            model.as_str()
+        )))
     }
 
-    fn decode(
-        &self,
-        _model: ModelName,
-        _ids: &[u32],
-    ) -> Result<Option<DecodeResult>, TokenizerError> {
-        Ok(None)
+    fn decode(&self, model: ModelName, _ids: &[u32]) -> Result<DecodeResult, TokenizerError> {
+        Err(TokenizerError::Unsupported(format!(
+            "model `{}` is not handled by the local decoder",
+            model.as_str()
+        )))
     }
 }
 

@@ -22,18 +22,49 @@ function logSuccess(op, model, tokenCount) {
  * Unsupported models fall through to the original path by design; this makes the
  * reason visible when debug is enabled, without affecting the info stream.
  */
-function logFallback(op, model) {
+function logFallback(op, model, error = null) {
+	const reason = error?.message ? `: ${error.message}` : "";
 	logger.debug(
-		`"${model || "unknown"}" not handled locally (${op}); using backend.`,
+		`"${model || "unknown"}" not handled locally (${op}); using backend${reason}.`,
 	);
 }
 
-// Counting is served by directly replacing `TokenHandler.prototype.countAsync`
-// (see installTokenHandlerFastPath), so no count request ever reaches the wire.
-// Encoding goes through `getTextTokens`, an ES-module export we cannot replace,
-// so its `POST /api/tokenizers/openai/encode` is intercepted at `$.ajax` instead.
+function makeTokenizerError(errorType, message) {
+	return { error_type: errorType, message };
+}
+
+function isTokenizerError(value) {
+	return Boolean(
+		value &&
+			typeof value === "object" &&
+			typeof value.error_type === "string" &&
+			typeof value.message === "string",
+	);
+}
+
+function isUninitializedTokenizerError(value) {
+	return isTokenizerError(value) && value.error_type === "UnInitialized";
+}
+
+// SillyTavern reaches the tokenizer server through jQuery.ajax on two endpoints:
+// `getTextTokens` (an ES-module export we cannot replace) encodes via
+// `POST /api/tokenizers/openai/encode`, and `getTokenCountAsync` counts via
+// `POST /api/tokenizers/openai/count`. Both are intercepted at `$.ajax`.
+//
+// The `TokenHandler.prototype.countAsync` fast path (see installTokenHandlerFastPath)
+// additionally short-circuits prompt-construction counting before a request is
+// ever built; but that path is not the only counter — standalone UI counts (chat
+// messages, character cards, world info budgets, …) still hit the count endpoint,
+// so the `$.ajax` net is what actually keeps every count off the wire.
 const ENCODE_ENDPOINT = "/api/tokenizers/openai/encode";
+const COUNT_ENDPOINT = "/api/tokenizers/openai/count";
 const TOKENIZER_METHOD = "POST";
+
+/** Maps a served endpoint pathname to the tokenizer op it performs. */
+const TOKENIZER_ENDPOINTS = Object.freeze({
+	[ENCODE_ENDPOINT]: "encode",
+	[COUNT_ENDPOINT]: "count",
+});
 
 let installPromise = null;
 
@@ -56,7 +87,7 @@ export function installTokenizer() {
 
 async function installTokenizerInner() {
 	await init();
-	installEncodeInterceptor();
+	installAjaxInterceptor();
 	await installTokenHandlerFastPath();
 	// Live verbosity toggle for field debugging, e.g. __stDotToolbox.setLogLevel("debug").
 	window.__stDotToolbox = { setLogLevel };
@@ -74,10 +105,12 @@ function normalizeMethod(method) {
 }
 
 /**
- * Returns the `?model=` for a local encode request, or `null` when the request
- * is not the OpenAI encode endpoint we serve.
+ * Classifies a jQuery ajax request as a tokenizer op we serve locally.
+ *
+ * Returns `{ op, model }` for a POST to one of the OpenAI tokenizer endpoints we
+ * handle, or `null` for any other request so the caller leaves it untouched.
  */
-function parseEncodeModel(rawUrl, method) {
+function parseTokenizerRequest(rawUrl, method) {
 	if (normalizeMethod(method) !== TOKENIZER_METHOD) {
 		return null;
 	}
@@ -94,11 +127,12 @@ function parseEncodeModel(rawUrl, method) {
 		return null;
 	}
 
-	if (normalizePathname(url.pathname) !== ENCODE_ENDPOINT) {
+	const op = TOKENIZER_ENDPOINTS[normalizePathname(url.pathname)];
+	if (!op) {
 		return null;
 	}
 
-	return url.searchParams.get("model") ?? "";
+	return { op, model: url.searchParams.get("model") ?? "" };
 }
 
 const TOKENIZER_ASSET_URLS = Object.freeze({
@@ -160,12 +194,57 @@ function warmTokenizerAsset(model) {
 
 /**
  * Encode a `{ text }` body locally. The Gemma asset is warmed but cannot be
- * awaited inside jQuery's blocking `$.ajax`; an unwarmed model returns `null`
- * for one call and falls back to the backend until the asset finishes loading.
+ * awaited inside jQuery's blocking `$.ajax`; an unwarmed model returns a
+ * structured `UnInitialized` error for one call and falls back to the backend
+ * until the asset finishes loading.
  */
 function encodeLocally(model, bodyText) {
 	warmTokenizerAsset(model);
 	return try_encode_request(model, bodyText);
+}
+
+/**
+ * Count a `[{ role, content }]` chat-message body locally.
+ *
+ * Rust returns an exact count when a provider is ready, or a heuristic fallback
+ * estimate for unsupported models. A structured `UnInitialized` error is
+ * reserved for a recognized asset tokenizer that has not loaded yet; in that one
+ * case this caller falls back to SillyTavern's native ajax path while the asset
+ * preload continues.
+ */
+function countLocally(model, bodyText) {
+	warmTokenizerAsset(model);
+
+	let messages;
+	try {
+		messages = JSON.parse(bodyText);
+	} catch (error) {
+		return makeTokenizerError("Json", error.message);
+	}
+	if (!Array.isArray(messages)) {
+		messages = [messages];
+	}
+
+	return try_count_chat_messages(model, messages);
+}
+
+/**
+ * Serves a classified tokenizer request locally, returning either a success
+ * payload or a structured tokenizer error.
+ *
+ * Count only returns an error while an asset-backed tokenizer is still loading.
+ * Encode can also error when no local encoder can produce ids/chunks for a model.
+ */
+function serveTokenizerLocally({ op, model }, bodyText) {
+	if (op === "encode") {
+		const payload = encodeLocally(model, bodyText);
+		if (!isTokenizerError(payload)) logSuccess("encode", model, payload.count);
+		return payload;
+	}
+
+	const payload = countLocally(model, bodyText);
+	if (!isTokenizerError(payload)) logSuccess("count", model, payload.token_count);
+	return payload;
 }
 
 function getAjaxRequest(options, settings) {
@@ -192,11 +271,12 @@ function resolveAjaxLocally($, request, payload) {
 	return jqXHR;
 }
 
-function installEncodeInterceptor() {
-	// `getTextTokens` reaches the server exclusively through `jQuery.ajax`
-	// (getTextTokensFromServer), so intercepting `$.ajax` covers every encode.
+function installAjaxInterceptor() {
+	// Both `getTextTokens` (encode) and `getTokenCountAsync` (count) reach the
+	// server exclusively through `jQuery.ajax`, so one `$.ajax` patch covers every
+	// encode and count request regardless of which SillyTavern caller issued it.
 	if (!window.jQuery) {
-		logger.warn("jQuery unavailable; encode requests will use the backend.");
+		logger.warn("jQuery unavailable; tokenizer requests will use the backend.");
 		return;
 	}
 
@@ -207,16 +287,19 @@ function installEncodeInterceptor() {
 		$.ajax = function stDotToolboxAjax(options, settings) {
 			try {
 				const request = getAjaxRequest(options, settings);
-				const model = request?.url
-					? parseEncodeModel(request.url, request.type ?? request.method)
+				const parsed = request?.url
+					? parseTokenizerRequest(request.url, request.type ?? request.method)
 					: null;
-				if (model !== null) {
-					const payload = encodeLocally(model, readAjaxBody(request));
-					if (payload) {
-						logSuccess("encode", model, payload.count);
+				if (parsed) {
+					const payload = serveTokenizerLocally(parsed, readAjaxBody(request));
+					if (isTokenizerError(payload)) {
+						if (isUninitializedTokenizerError(payload)) {
+							warmTokenizerAsset(parsed.model);
+						}
+						logFallback(parsed.op, parsed.model, payload);
+					} else {
 						return resolveAjaxLocally($, request, payload);
 					}
-					logFallback("encode", model);
 				}
 			} catch (error) {
 				logger.error(
@@ -231,7 +314,7 @@ function installEncodeInterceptor() {
 		return { originalAjax };
 	});
 
-	if (installed) logger.debug("jQuery encode interceptor installed.");
+	if (installed) logger.debug("jQuery tokenizer interceptor installed.");
 }
 
 async function installTokenHandlerFastPath() {
@@ -259,12 +342,11 @@ async function installTokenHandlerFastPath() {
 							// Pass live message objects straight to Rust; the WASM
 							// boundary deserializes them without a JSON string hop.
 							const payload = try_count_chat_messages(model, messagesArray);
-							if (!payload) {
-								// A miss on a Gemma model means its asset has not loaded
-								// yet; warm it (a no-op for models needing no asset) so the
-								// next count is exact. This call falls back meanwhile.
-								warmTokenizerAsset(model);
-								logFallback("count", model);
+							if (isTokenizerError(payload)) {
+								if (isUninitializedTokenizerError(payload)) {
+									warmTokenizerAsset(model);
+								}
+								logFallback("count", model, payload);
 								return originalCountAsync.call(this, messages, full, type);
 							}
 

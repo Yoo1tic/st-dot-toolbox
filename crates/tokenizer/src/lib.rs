@@ -80,7 +80,7 @@ struct EncodeRequest {
 /// message objects once, without a `JSON.stringify` round-trip. The entry point
 /// stays free of any provider's message shape; each provider adapts this neutral
 /// value into its own representation via [`Tokenizer::count`].
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(transparent)]
 pub struct CountTokenRequest(serde_json::Value);
 
@@ -103,10 +103,7 @@ pub fn try_count_messages(
     body_json: &str,
 ) -> Result<CountResult, TokenizerError> {
     let messages: CountTokenRequest = serde_json::from_str(body_json)?;
-    match try_count_chat_messages(model.clone(), messages)? {
-        Some(result) => Ok(result),
-        None => Ok(FallbackTokenizer.estimate(model, body_json)),
-    }
+    try_count_chat_messages(model, messages)
 }
 
 /// Counts already-parsed chat messages, routing on the model's provider.
@@ -117,42 +114,29 @@ pub fn try_count_messages(
 /// [`CountTokenRequest`], avoiding a `JSON.stringify`/`serde_json` round-trip on the
 /// hot prompt-construction path.
 ///
-/// Yields `Ok(None)` when the model has no local provider, or when the selected
-/// provider recognizes the model but cannot count it right now — its asset has not
-/// loaded, or it has no exact chat tokenizer ([`TokenizerError::is_fallback`]) — so
-/// callers can keep SillyTavern's fallback path.
+/// Unknown models and provider-level fallback errors are handled locally by the
+/// heuristic fallback tokenizer. Uninitialized provider assets are returned as a
+/// structured error so JavaScript can load the asset and use its native request
+/// path for that call.
 pub fn try_count_chat_messages(
     model: ModelName,
     messages: CountTokenRequest,
-) -> Result<Option<CountResult>, TokenizerError> {
-    let Some(provider) = model.tokenizer_provider() else {
-        return Ok(None);
-    };
-    match provider.count(model, messages) {
-        Ok(result) => Ok(Some(result)),
-        Err(error) if error.is_fallback() => Ok(None),
-        Err(error) => Err(error),
-    }
+) -> Result<CountResult, TokenizerError> {
+    let provider = TokenizerProvider::from_model_name_or_fallback(&model);
+    provider.count(model, messages)
 }
 
 /// Encodes text with the tokenizer associated with `model`.
 ///
-/// Returns token ids, token count, and per-token UTF-8 chunks. `Ok(None)` means
-/// there is no usable local tokenizer — the model is unknown, or its asset has not
-/// loaded ([`TokenizerError::is_fallback`]) — and callers should fall back to their
-/// original tokenizer path.
-pub fn try_encode_text(
-    model: ModelName,
-    text: &str,
-) -> Result<Option<EncodeResult>, TokenizerError> {
+/// Returns token ids, token count, and per-token UTF-8 chunks.
+pub fn try_encode_text(model: ModelName, text: &str) -> Result<EncodeResult, TokenizerError> {
     let Some(provider) = model.tokenizer_provider() else {
-        return Ok(None);
+        return Err(TokenizerError::Unsupported(format!(
+            "model `{}` is not handled by the local encoder",
+            model.as_str()
+        )));
     };
-    match provider.encode(model, text) {
-        Ok(result) => Ok(result),
-        Err(error) if error.is_fallback() => Ok(None),
-        Err(error) => Err(error),
-    }
+    provider.encode(model, text)
 }
 
 /// Encodes the JSON body sent to SillyTavern's encode endpoint.
@@ -162,7 +146,7 @@ pub fn try_encode_text(
 pub fn try_encode_request(
     model: ModelName,
     body_json: &str,
-) -> Result<Option<EncodeResult>, TokenizerError> {
+) -> Result<EncodeResult, TokenizerError> {
     let request: EncodeRequest = serde_json::from_str(body_json)?;
     try_encode_text(model, &request.text)
 }
@@ -228,20 +212,16 @@ mod tests {
     fn tokenizer_decode_is_reserved() -> Result<(), String> {
         let openai = OpenAiTokenizer::from_model_name("gpt-4o")
             .ok_or_else(|| "gpt-4o should resolve".to_string())?;
-        assert_eq!(
-            openai
-                .decode(model("gpt-4o"), &[1, 2, 3])
-                .map_err(|error| error.to_string())?,
-            None
-        );
+        assert!(matches!(
+            openai.decode(model("gpt-4o"), &[1, 2, 3]),
+            Err(TokenizerError::Unsupported(_))
+        ));
         let gemma = GemmaTokenizer::from_model_name("gemini")
             .ok_or_else(|| "gemini should resolve".to_string())?;
-        assert_eq!(
-            gemma
-                .decode(model("gemini"), &[1, 2, 3])
-                .map_err(|error| error.to_string())?,
-            None
-        );
+        assert!(matches!(
+            gemma.decode(model("gemini"), &[1, 2, 3]),
+            Err(TokenizerError::Unsupported(_))
+        ));
         Ok(())
     }
 
@@ -264,30 +244,40 @@ mod tests {
         let messages: CountTokenRequest =
             serde_json::from_str(body).map_err(|error| error.to_string())?;
         let from_parsed = try_count_chat_messages(model("gpt-4o"), messages)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "parsed path should count".to_string())?;
+            .map_err(|error| error.to_string())?;
 
         assert_eq!(from_string.token_count, from_parsed.token_count);
         Ok(())
     }
 
     #[test]
-    fn parsed_message_path_skips_unsupported_models() -> Result<(), String> {
+    fn parsed_message_path_estimates_unsupported_models() -> Result<(), String> {
         let messages: CountTokenRequest =
             serde_json::from_str(r#"[{"role":"user","content":"hi"}]"#)
                 .map_err(|error| error.to_string())?;
-        assert_eq!(
-            try_count_chat_messages(model("claude"), messages).map_err(|error| error.to_string())?,
-            None
-        );
+        let result = try_count_chat_messages(model("claude"), messages)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(result.label, ProviderLabel::Fallback);
+        assert!(result.token_count > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn parsed_message_path_defers_uninitialized_assets() -> Result<(), String> {
+        let messages: CountTokenRequest =
+            serde_json::from_str(r#"[{"role":"user","content":"hi"}]"#)
+                .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            try_count_chat_messages(model("gemini-2.5-pro"), messages),
+            Err(TokenizerError::UnInitialized(ProviderLabel::Gemma))
+        ));
         Ok(())
     }
 
     #[test]
     fn encodes_request_bodies() -> Result<(), String> {
         let result = try_encode_request(model("gpt-4o"), r#"{"text":"hello world"}"#)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "gpt-4o should encode locally".to_string())?;
+            .map_err(|error| error.to_string())?;
         assert_eq!(result.count, result.ids.len());
         Ok(())
     }

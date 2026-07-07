@@ -1,7 +1,7 @@
 //! Text encoding through `tiktoken-rs`.
 
 use serde::{Deserialize, Serialize};
-use tiktoken_rs::{CoreBPE, Rank, bpe_for_tokenizer};
+use tiktoken_rs::{CoreBPE, Rank};
 
 use super::OpenAiTokenizer;
 use crate::{ModelName, ProviderLabel, TokenizerError};
@@ -28,10 +28,7 @@ pub fn encode_text(
     label: ProviderLabel,
     text: &str,
 ) -> Result<EncodeResult, TokenizerError> {
-    let bpe = bpe_for_tokenizer(tokenizer.kind())
-        .map_err(|error| TokenizerError::Tiktoken(error.to_string()))?;
-
-    Ok(encode_impl(bpe, model, label, text))
+    Ok(encode_impl(tokenizer.get_tokenizer(), model, label, text))
 }
 
 fn encode_impl(bpe: &CoreBPE, model: ModelName, label: ProviderLabel, text: &str) -> EncodeResult {
