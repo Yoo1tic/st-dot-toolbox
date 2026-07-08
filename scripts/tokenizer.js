@@ -1,11 +1,11 @@
 // Local WASM tokenizer feature for SillyTavern OpenAI/tiktoken models.
 
 import init, {
-	init_tokenizer_asset,
-	tokenizer_asset_for_model,
-	try_count_chat_messages,
-	try_encode_request,
-} from "../pkg/st_dot_toolbox.js";
+	st_dot_get_text_tokens,
+	st_dot_get_token_count_async,
+	st_dot_init_tokenizer_provider,
+	st_dot_token_handler_count_async,
+} from "../pkg/st_dot_toolbox_tokenizer.js";
 import { createLogger, setLogLevel } from "./logger.js";
 import { patchOnce } from "./patching.js";
 
@@ -23,27 +23,37 @@ function logSuccess(op, model, tokenCount) {
  * reason visible when debug is enabled, without affecting the info stream.
  */
 function logFallback(op, model, error = null) {
+	const modelName =
+		typeof error?.model_name === "string" && error.model_name
+			? error.model_name
+			: model;
+	const provider =
+		typeof error?.provider === "string" && error.provider
+			? `; provider=${error.provider}`
+			: "";
 	const reason = error?.message ? `: ${error.message}` : "";
 	logger.debug(
-		`"${model || "unknown"}" not handled locally (${op}); using backend${reason}.`,
+		`"${modelName || "unknown"}" not handled locally (${op}${provider}); using backend${reason}.`,
 	);
 }
 
-function makeTokenizerError(errorType, message) {
-	return { error_type: errorType, message };
+function makeTokenizerError(errorName, message, modelName = "", provider = "") {
+	return { error: errorName, message, model_name: modelName, provider };
 }
 
 function isTokenizerError(value) {
 	return Boolean(
 		value &&
 			typeof value === "object" &&
-			typeof value.error_type === "string" &&
-			typeof value.message === "string",
+			typeof value.error === "string" &&
+			typeof value.message === "string" &&
+			typeof value.model_name === "string" &&
+			typeof value.provider === "string",
 	);
 }
 
 function isUninitializedTokenizerError(value) {
-	return isTokenizerError(value) && value.error_type === "UnInitialized";
+	return isTokenizerError(value) && value.error === "UnInitialized";
 }
 
 // SillyTavern reaches the tokenizer server through jQuery.ajax on two endpoints:
@@ -135,24 +145,24 @@ function parseTokenizerRequest(rawUrl, method) {
 	return { op, model: url.searchParams.get("model") ?? "" };
 }
 
-const TOKENIZER_ASSET_URLS = Object.freeze({
+const TOKENIZER_PROVIDER_ASSET_URLS = Object.freeze({
 	gemma: new URL("../assets/gemma/tokenizer.json.gz", import.meta.url),
 });
-const tokenizerAssetPromises = new Map();
+const tokenizerProviderPromises = new Map();
 
-function tokenizerAssetUrl(assetId) {
-	const url = TOKENIZER_ASSET_URLS[assetId];
-	if (!url) throw new Error(`unknown tokenizer asset: ${assetId}`);
+function tokenizerProviderAssetUrl(provider) {
+	const url = TOKENIZER_PROVIDER_ASSET_URLS[provider];
+	if (!url) throw new Error(`unknown tokenizer provider: ${provider}`);
 	return url;
 }
 
-async function fetchCompressedTokenizerJson(assetId) {
-	const response = await fetch(tokenizerAssetUrl(assetId), {
+async function fetchCompressedTokenizerJson(provider) {
+	const response = await fetch(tokenizerProviderAssetUrl(provider), {
 		cache: "force-cache",
 	});
 	if (!response.ok) {
 		throw new Error(
-			`failed to fetch compressed tokenizer asset ${assetId}: ${response.status} ${response.statusText}`,
+			`failed to fetch compressed tokenizer provider ${provider}: ${response.status} ${response.statusText}`,
 		);
 	}
 	if (!response.body || typeof DecompressionStream !== "function") {
@@ -163,76 +173,78 @@ async function fetchCompressedTokenizerJson(assetId) {
 	return new Response(stream).text();
 }
 
-function ensureTokenizerAsset(model) {
-	const assetId = tokenizer_asset_for_model(model);
-	if (!assetId) return false;
+function ensureTokenizerProvider(provider) {
+	if (!provider) return false;
 
-	if (!tokenizerAssetPromises.has(assetId)) {
-		const promise = fetchCompressedTokenizerJson(assetId)
+	if (!tokenizerProviderPromises.has(provider)) {
+		const promise = fetchCompressedTokenizerJson(provider)
 			.then((tokenizerJson) => {
-				init_tokenizer_asset(assetId, tokenizerJson);
-				logger.info(`tokenizer asset initialized: ${assetId}.`);
+				st_dot_init_tokenizer_provider(provider, tokenizerJson);
+				logger.info(`tokenizer provider initialized: ${provider}.`);
 				return true;
 			})
 			.catch((error) => {
-				tokenizerAssetPromises.delete(assetId);
+				tokenizerProviderPromises.delete(provider);
 				throw error;
 			});
-		tokenizerAssetPromises.set(assetId, promise);
+		tokenizerProviderPromises.set(provider, promise);
 	}
 
-	return tokenizerAssetPromises.get(assetId);
+	return tokenizerProviderPromises.get(provider);
 }
 
-function warmTokenizerAsset(model) {
-	if (tokenizer_asset_for_model(model)) {
-		void ensureTokenizerAsset(model).catch((error) => {
-			logger.warn("tokenizer asset preload failed:", error);
+function tokenizerProviderFromError(error) {
+	return isUninitializedTokenizerError(error) &&
+		typeof error.provider === "string" &&
+		error.provider
+		? error.provider
+		: "";
+}
+
+function warmTokenizerProviderFromError(error) {
+	const provider = tokenizerProviderFromError(error);
+	if (provider) {
+		void ensureTokenizerProvider(provider).catch((error) => {
+			logger.warn(`tokenizer provider preload failed: ${provider}`, error);
 		});
 	}
 }
 
 /**
- * Encode a `{ text }` body locally. The Gemma asset is warmed but cannot be
- * awaited inside jQuery's blocking `$.ajax`; an unwarmed model returns a
- * structured `UnInitialized` error for one call and falls back to the backend
- * until the asset finishes loading.
+ * Encode a `{ text }` body locally. An unwarmed provider-backed model returns a
+ * structured `UnInitialized` error for one call; the caller starts loading that
+ * provider and falls back to the backend until it finishes.
  */
 function encodeLocally(model, bodyText) {
-	warmTokenizerAsset(model);
-	return try_encode_request(model, bodyText);
+	return st_dot_get_text_tokens(model, bodyText);
 }
 
 /**
  * Count a `[{ role, content }]` chat-message body locally.
  *
- * Rust returns an exact count when a provider is ready, or a heuristic fallback
- * estimate for unsupported models. A structured `UnInitialized` error is
- * reserved for a recognized asset tokenizer that has not loaded yet; in that one
- * case this caller falls back to SillyTavern's native ajax path while the asset
- * preload continues.
+ * Rust returns an exact count when a provider is ready, or a structured error
+ * when the local tokenizer cannot serve the request. The caller then falls back
+ * to SillyTavern's native ajax path while any returned provider preload continues.
  */
 function countLocally(model, bodyText) {
-	warmTokenizerAsset(model);
-
 	let messages;
 	try {
 		messages = JSON.parse(bodyText);
 	} catch (error) {
-		return makeTokenizerError("Json", error.message);
+		return makeTokenizerError("Json", error.message, model);
 	}
 	if (!Array.isArray(messages)) {
 		messages = [messages];
 	}
 
-	return try_count_chat_messages(model, messages);
+	return st_dot_get_token_count_async(model, messages);
 }
 
 /**
  * Serves a classified tokenizer request locally, returning either a success
  * payload or a structured tokenizer error.
  *
- * Count only returns an error while an asset-backed tokenizer is still loading.
+ * Count only returns an error while a provider-backed tokenizer is still loading.
  * Encode can also error when no local encoder can produce ids/chunks for a model.
  */
 function serveTokenizerLocally({ op, model }, bodyText) {
@@ -294,7 +306,7 @@ function installAjaxInterceptor() {
 					const payload = serveTokenizerLocally(parsed, readAjaxBody(request));
 					if (isTokenizerError(payload)) {
 						if (isUninitializedTokenizerError(payload)) {
-							warmTokenizerAsset(parsed.model);
+							warmTokenizerProviderFromError(payload);
 						}
 						logFallback(parsed.op, parsed.model, payload);
 					} else {
@@ -341,10 +353,13 @@ async function installTokenHandlerFastPath() {
 
 							// Pass live message objects straight to Rust; the WASM
 							// boundary deserializes them without a JSON string hop.
-							const payload = try_count_chat_messages(model, messagesArray);
+							const payload = st_dot_token_handler_count_async(
+								model,
+								messagesArray,
+							);
 							if (isTokenizerError(payload)) {
 								if (isUninitializedTokenizerError(payload)) {
-									warmTokenizerAsset(model);
+									warmTokenizerProviderFromError(payload);
 								}
 								logFallback("count", model, payload);
 								return originalCountAsync.call(this, messages, full, type);

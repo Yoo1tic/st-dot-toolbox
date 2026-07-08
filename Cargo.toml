@@ -1,6 +1,6 @@
 [workspace]
-members = [".", "crates/tokenizer"]
-default-members = [".", "crates/tokenizer"]
+members = ["crates/tokenizer"]
+default-members = ["crates/tokenizer"]
 resolver = "3"
 
 [workspace.package]
@@ -13,31 +13,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 serde-wasm-bindgen = "0.6"
 thiserror = "2.0"
-tiktoken-rs = "0.12"
-tokenizers = { version = "0.23", default-features = false, features = [
-  "unstable_wasm",
-] }
 wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1.7"
-
-[package]
-name = "st-dot-toolbox"
-version.workspace = true
-authors.workspace = true
-edition.workspace = true
-
-[lib]
-crate-type = ["cdylib", "rlib"]
-
-[dependencies]
-st-dot-toolbox-tokenizer = { path = "crates/tokenizer" }
-wasm-bindgen.workspace = true
-serde-wasm-bindgen.workspace = true
-console_error_panic_hook.workspace = true
-serde.workspace = true
-
-[dev-dependencies]
-wasm-bindgen-test = "0.3"
 
 [profile.release]
 opt-level = "z"

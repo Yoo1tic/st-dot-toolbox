@@ -1,8 +1,8 @@
 //! Gemma/Gemini-family tokenization through Hugging Face `tokenizers`.
 //!
-//! The tokenizer is supplied by JavaScript as a `tokenizer.json` asset. Because a
+//! The tokenizer is supplied by JavaScript as a `tokenizer.json` payload. Because a
 //! [`GemmaTokenizer`] handle is a transient value derived from a model name — and
-//! must exist *before* the asset loads, so routing can request it — the parsed
+//! must exist *before* the provider data loads, so routing can request it — the parsed
 //! tokenizer lives in a process-wide [`OnceLock`]: a load-once, immutable-after,
 //! shared singleton. Each handle borrows that singleton, holding `None` until it
 //! is present. This keeps the WASM binary small and avoids reparsing a large
@@ -23,11 +23,11 @@ use crate::{
 /// write-once, read-many invariant for free.
 static GEMMA_TOKENIZER: OnceLock<HuggingFaceTokenizer> = OnceLock::new();
 
-/// Gemma-family tokenizer handle backed by a Hugging Face `tokenizer.json` asset.
+/// Gemma-family tokenizer handle backed by a Hugging Face `tokenizer.json`.
 ///
-/// Holds a borrow of the shared singleton, or `None` before the asset has loaded.
+/// Holds a borrow of the shared singleton, or `None` before the provider data has loaded.
 /// The `None` state is what lets routing recognize a Gemma model yet still report
-/// itself uninitialized, so callers can defer to their fallback until the asset
+/// itself uninitialized, so callers can defer to the original request until the provider
 /// arrives.
 #[derive(Clone, Copy)]
 pub struct GemmaTokenizer {
@@ -76,23 +76,24 @@ impl Tokenizer for GemmaTokenizer {
     /// Counts messages by flattening their text and encoding it with the loaded
     /// Hugging Face tokenizer.
     ///
-    /// Returns [`TokenizerError::UnInitialized`] when the asset has not loaded, so
-    /// the router can fall back. The count is not chat-template exact — Gemma's
-    /// template is not applied — but it uses the model's real vocabulary, which is
-    /// far closer than the character-ratio fallback.
+    /// Returns [`TokenizerError::UnInitialized`] when the provider data has not loaded, so
+    /// JavaScript can defer to the original request path. The count is not
+    /// chat-template exact — Gemma's template is not applied — but it uses the
+    /// model's real vocabulary.
     fn count(
         &self,
         model: ModelName,
         messages: CountTokenRequest,
     ) -> Result<CountResult, TokenizerError> {
         let Some(tokenizer) = self.get_tokenizer() else {
-            return Err(TokenizerError::UnInitialized(Self::LABEL));
+            return Err(TokenizerError::UnInitialized {
+                model_name: model,
+                provider: Self::LABEL.as_str(),
+            });
         };
 
         let text = flatten_messages(messages)?;
-        let encoding = tokenizer
-            .encode_fast(text, false)
-            .map_err(|error| TokenizerError::HuggingfaceTokenizer(error.to_string()))?;
+        let encoding = tokenizer.encode_fast(text, false)?;
 
         Ok(CountResult {
             token_count: encoding.len(),
@@ -103,12 +104,13 @@ impl Tokenizer for GemmaTokenizer {
 
     fn encode(&self, model: ModelName, text: &str) -> Result<EncodeResult, TokenizerError> {
         let Some(tokenizer) = self.get_tokenizer() else {
-            return Err(TokenizerError::UnInitialized(Self::LABEL));
+            return Err(TokenizerError::UnInitialized {
+                model_name: model,
+                provider: Self::LABEL.as_str(),
+            });
         };
 
-        let encoding = tokenizer
-            .encode_fast(text, false)
-            .map_err(|error| TokenizerError::HuggingfaceTokenizer(error.to_string()))?;
+        let encoding = tokenizer.encode_fast(text, false)?;
         let ids = encoding.get_ids().to_vec();
         let chunks = encoding.get_tokens().to_vec();
 
@@ -138,8 +140,7 @@ pub fn init_tokenizer(tokenizer_json: &str) -> Result<(), TokenizerError> {
         return Ok(());
     }
 
-    let tokenizer = HuggingFaceTokenizer::from_bytes(tokenizer_json.as_bytes())
-        .map_err(|error| TokenizerError::HuggingfaceTokenizer(error.to_string()))?;
+    let tokenizer = HuggingFaceTokenizer::from_bytes(tokenizer_json.as_bytes())?;
     let _ = GEMMA_TOKENIZER.set(tokenizer);
     Ok(())
 }
@@ -226,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn uninitialized_handle_reports_a_fallback_error() {
+    fn uninitialized_handle_reports_provider_context() {
         let handle =
             GemmaTokenizer::from_model_name("gemini").expect("gemini is a Gemma-family model");
         assert!(handle.get_tokenizer().is_none());
@@ -234,10 +235,12 @@ mod tests {
         let error = handle
             .encode(ModelName::from_js("gemini"), "hello")
             .expect_err("an uninitialized handle cannot encode");
-        assert!(error.is_fallback());
         assert!(matches!(
             error,
-            TokenizerError::UnInitialized(ProviderLabel::Gemma)
+            TokenizerError::UnInitialized {
+                model_name,
+                provider: "gemma",
+            } if model_name.as_str() == "gemini"
         ));
     }
 

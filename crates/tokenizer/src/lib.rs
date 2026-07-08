@@ -1,21 +1,28 @@
 //! Local tokenization logic for SillyTavern-compatible tokenizer requests.
 //!
-//! The crate deliberately has no `wasm-bindgen` dependency. It exposes pure
-//! Rust operations that the root WASM facade can adapt for JavaScript.
+//! The crate exposes pure Rust tokenizer operations and, on wasm targets, the
+//! JavaScript-callable `wasm-bindgen` boundary used by the extension.
 
 mod error;
-mod fallback;
 mod google;
 mod openai;
 mod router;
+#[cfg(target_arch = "wasm32")]
+mod wasm;
 
-pub use fallback::FallbackTokenizer;
 pub use google::gemma::GemmaTokenizer;
 pub use openai::{OpenAiTokenizer, encode::EncodeResult};
-pub use router::{Tokenizer, TokenizerAsset, TokenizerProvider, TokenizerProviderForModel};
+pub use router::{Tokenizer, TokenizerProvider};
+#[cfg(target_arch = "wasm32")]
+pub use wasm::{
+    st_dot_count_messages_json_wasm, st_dot_encode_text_wasm, st_dot_get_text_tokens_wasm,
+    st_dot_get_token_count_async_wasm, st_dot_init_tokenizer_provider_wasm,
+    st_dot_token_handler_count_async_wasm, start,
+};
 
 pub use error::TokenizerError;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Stable provider tag stamped onto every tokenizer result for logging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -25,8 +32,16 @@ pub enum ProviderLabel {
     OpenAi,
     /// Gemma/Gemini-family tokenizer served by Hugging Face `tokenizers`.
     Gemma,
-    /// Heuristic character-ratio estimate for models with no exact tokenizer.
-    Fallback,
+}
+
+impl ProviderLabel {
+    /// Stable lowercase identifier used in JavaScript payloads and provider folders.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Gemma => "gemma",
+        }
+    }
 }
 
 /// Token count returned to JavaScript.
@@ -68,6 +83,12 @@ impl ModelName {
     }
 }
 
+impl fmt::Display for ModelName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Deserialize)]
 struct EncodeRequest {
     #[serde(default)]
@@ -91,13 +112,13 @@ impl CountTokenRequest {
     }
 }
 
-/// Counts a JSON-string chat-message body, always returning a local count.
+/// Counts a JSON-string chat-message body locally.
 ///
 /// `body_json` must be a JSON array of chat messages. It is parsed into the
 /// neutral [`CountTokenRequest`] and routed through [`try_count_chat_messages`]:
-/// models with an exact tokenizer are counted precisely, and every other model
-/// falls back to the [`FallbackTokenizer`] heuristic, so callers no longer need
-/// SillyTavern's original tokenizer path for counting.
+/// models with an exact local tokenizer are counted precisely, and every other
+/// model returns a structured error so JavaScript can use SillyTavern's original
+/// request path.
 pub fn try_count_messages(
     model: ModelName,
     body_json: &str,
@@ -114,15 +135,18 @@ pub fn try_count_messages(
 /// [`CountTokenRequest`], avoiding a `JSON.stringify`/`serde_json` round-trip on the
 /// hot prompt-construction path.
 ///
-/// Unknown models and provider-level fallback errors are handled locally by the
-/// heuristic fallback tokenizer. Uninitialized provider assets are returned as a
-/// structured error so JavaScript can load the asset and use its native request
-/// path for that call.
+/// Unknown models and provider-level failures are returned as structured errors
+/// so JavaScript can use SillyTavern's native request path for that call.
 pub fn try_count_chat_messages(
     model: ModelName,
     messages: CountTokenRequest,
 ) -> Result<CountResult, TokenizerError> {
-    let provider = TokenizerProvider::from_model_name_or_fallback(&model);
+    let Some(provider) = TokenizerProvider::from_model_name(&model) else {
+        return Err(TokenizerError::Unsupported(format!(
+            "model `{}` is not handled by the local counter",
+            model.as_str()
+        )));
+    };
     provider.count(model, messages)
 }
 
@@ -130,7 +154,7 @@ pub fn try_count_chat_messages(
 ///
 /// Returns token ids, token count, and per-token UTF-8 chunks.
 pub fn try_encode_text(model: ModelName, text: &str) -> Result<EncodeResult, TokenizerError> {
-    let Some(provider) = model.tokenizer_provider() else {
+    let Some(provider) = TokenizerProvider::from_model_name(&model) else {
         return Err(TokenizerError::Unsupported(format!(
             "model `{}` is not handled by the local encoder",
             model.as_str()
@@ -151,19 +175,15 @@ pub fn try_encode_request(
     try_encode_text(model, &request.text)
 }
 
-/// Returns the tokenizer asset a `model` needs to be served locally, if any.
-///
-/// A pure predicate on the model name: it names *which* asset the model requires,
-/// independent of load state. Loading each asset at most once is the caller's
-/// concern — the JavaScript loader already dedupes by asset id — so this stays a
-/// stateless model-to-asset map.
-pub fn required_tokenizer_asset(model: ModelName) -> Option<TokenizerAsset> {
-    GemmaTokenizer::supports_model(model.as_str()).then_some(TokenizerAsset::Gemma)
-}
+/// Initializes the tokenizer data for a provider requested by Rust.
+pub fn init_tokenizer_provider(provider: &str, tokenizer_json: &str) -> Result<(), TokenizerError> {
+    if provider == <GemmaTokenizer as Tokenizer>::LABEL.as_str() {
+        return google::gemma::init_tokenizer(tokenizer_json);
+    }
 
-/// Initializes a tokenizer asset previously requested by Rust.
-pub fn init_tokenizer_asset(asset_id: &str, tokenizer_json: &str) -> Result<(), TokenizerError> {
-    TokenizerAsset::from_id(asset_id)?.init(tokenizer_json)
+    Err(TokenizerError::Unsupported(format!(
+        "unknown tokenizer provider `{provider}`"
+    )))
 }
 
 #[cfg(test)]
@@ -180,32 +200,36 @@ mod tests {
     }
 
     #[test]
-    fn estimates_unsupported_chat_models_with_fallback() -> Result<(), String> {
-        for model_name in ["claude", "text-davinci-003"] {
-            let result =
-                try_count_messages(model(model_name), r#"[{"role":"user","content":"hi"}]"#)
-                    .map_err(|error| error.to_string())?;
-            assert_eq!(result.label, ProviderLabel::Fallback);
-            assert!(result.token_count > 0);
-        }
+    fn unsupported_chat_models_return_errors_for_js_fallback() -> Result<(), String> {
+        assert!(matches!(
+            try_count_messages(model("claude"), r#"[{"role":"user","content":"hi"}]"#),
+            Err(TokenizerError::Unsupported(_))
+        ));
+
+        let error = try_count_messages(
+            model("text-davinci-003"),
+            r#"[{"role":"user","content":"hi"}]"#,
+        )
+        .expect_err("non-chat OpenAI models should defer to JavaScript fallback");
+        assert!(matches!(error, TokenizerError::Tiktoken(_)));
         Ok(())
     }
 
     #[test]
     fn derives_tokenizer_provider_from_model_name() {
         assert!(matches!(
-            model("gemini-2.5-pro").tokenizer_provider(),
+            TokenizerProvider::from_model_name(&model("gemini-2.5-pro")),
             Some(TokenizerProvider::Gemma(_))
         ));
         assert!(matches!(
-            model("gpt-4o").tokenizer_provider(),
+            TokenizerProvider::from_model_name(&model("gpt-4o")),
             Some(TokenizerProvider::OpenAi(_))
         ));
         assert!(matches!(
-            model("text-davinci-003").tokenizer_provider(),
+            TokenizerProvider::from_model_name(&model("text-davinci-003")),
             Some(TokenizerProvider::OpenAi(_))
         ));
-        assert!(model("claude").tokenizer_provider().is_none());
+        assert!(TokenizerProvider::from_model_name(&model("claude")).is_none());
     }
 
     #[test]
@@ -251,26 +275,30 @@ mod tests {
     }
 
     #[test]
-    fn parsed_message_path_estimates_unsupported_models() -> Result<(), String> {
-        let messages: CountTokenRequest =
-            serde_json::from_str(r#"[{"role":"user","content":"hi"}]"#)
-                .map_err(|error| error.to_string())?;
-        let result = try_count_chat_messages(model("claude"), messages)
-            .map_err(|error| error.to_string())?;
-        assert_eq!(result.label, ProviderLabel::Fallback);
-        assert!(result.token_count > 0);
-        Ok(())
-    }
-
-    #[test]
-    fn parsed_message_path_defers_uninitialized_assets() -> Result<(), String> {
+    fn parsed_message_path_reports_unsupported_models() -> Result<(), String> {
         let messages: CountTokenRequest =
             serde_json::from_str(r#"[{"role":"user","content":"hi"}]"#)
                 .map_err(|error| error.to_string())?;
         assert!(matches!(
-            try_count_chat_messages(model("gemini-2.5-pro"), messages),
-            Err(TokenizerError::UnInitialized(ProviderLabel::Gemma))
+            try_count_chat_messages(model("claude"), messages),
+            Err(TokenizerError::Unsupported(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn parsed_message_path_defers_uninitialized_providers() -> Result<(), String> {
+        let messages: CountTokenRequest =
+            serde_json::from_str(r#"[{"role":"user","content":"hi"}]"#)
+                .map_err(|error| error.to_string())?;
+        let error = try_count_chat_messages(model("gemini-2.5-pro"), messages)
+            .expect_err("uninitialized Gemma provider should be deferred");
+        assert!(matches!(error, TokenizerError::UnInitialized { .. }));
+
+        let body = error.body();
+        assert_eq!(body.error, "UnInitialized");
+        assert_eq!(body.model_name.as_str(), "gemini-2.5-pro");
+        assert_eq!(body.provider, "gemma");
         Ok(())
     }
 
@@ -285,15 +313,6 @@ mod tests {
     #[test]
     fn rejects_malformed_encode_bodies() {
         assert!(try_encode_request(model("gpt-4o"), r#""hello""#).is_err());
-    }
-
-    #[test]
-    fn selects_gemma_asset_for_gemini_family() {
-        assert_eq!(
-            required_tokenizer_asset(model("gemini-2.5-pro")),
-            Some(TokenizerAsset::Gemma)
-        );
-        assert_eq!(required_tokenizer_asset(model("gpt-4o")), None);
     }
 
     #[test]

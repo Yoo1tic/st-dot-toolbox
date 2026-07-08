@@ -16,8 +16,7 @@ pub(crate) fn count(model: &str, messages: CountTokenRequest) -> Result<usize, T
         .map(ChatCompletionRequestMessage::try_from)
         .collect::<Result<Vec<_>, _>>()?;
 
-    num_tokens_from_messages(model, &messages)
-        .map_err(|error| TokenizerError::Tiktoken(error.to_string()))
+    Ok(num_tokens_from_messages(model, &messages)?)
 }
 
 #[derive(Deserialize)]

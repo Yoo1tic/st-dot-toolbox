@@ -730,26 +730,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "st-dot-toolbox"
-version = "0.1.0"
-dependencies = [
- "console_error_panic_hook",
- "serde",
- "serde-wasm-bindgen",
- "st-dot-toolbox-tokenizer",
- "wasm-bindgen",
- "wasm-bindgen-test",
-]
-
-[[package]]
 name = "st-dot-toolbox-tokenizer"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "console_error_panic_hook",
  "serde",
+ "serde-wasm-bindgen",
  "serde_json",
  "thiserror",
  "tiktoken-rs",
  "tokenizers",
+ "wasm-bindgen",
+ "wasm-bindgen-test",
 ]
 
 [[package]]

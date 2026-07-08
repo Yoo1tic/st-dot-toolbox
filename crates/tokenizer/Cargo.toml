@@ -4,9 +4,23 @@ version.workspace = true
 authors.workspace = true
 edition.workspace = true
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
+anyhow = "1.0"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tiktoken-rs.workspace = true
-tokenizers.workspace = true
+tiktoken-rs = "0.12"
+tokenizers = { version = "0.23", default-features = false, features = [
+  "unstable_wasm",
+] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook.workspace = true
+serde-wasm-bindgen.workspace = true
+wasm-bindgen.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"

@@ -62,9 +62,8 @@ impl Tokenizer for OpenAiTokenizer {
     /// Counts chat messages with `tiktoken-rs`.
     ///
     /// A model can resolve a tokenizer yet still lack chat-counting support (for
-    /// example the non-chat `text-davinci` models). Those surface as a
-    /// [`is_fallback`](TokenizerError::is_fallback) error, which the router folds
-    /// into its fallback path rather than a hard failure.
+    /// example the non-chat `text-davinci` models). Those errors are returned to
+    /// JavaScript so the original request path can handle the call.
     fn count(
         &self,
         model: ModelName,

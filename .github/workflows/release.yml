@@ -49,7 +49,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build wasm
-        run: wasm-pack build --target web -- --locked
+        run: |
+          rm -rf pkg
+          wasm-pack build crates/tokenizer --target web --out-dir ../../pkg -- --locked
 
       - name: Assemble extension folder
         run: |
