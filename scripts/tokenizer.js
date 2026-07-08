@@ -10,31 +10,120 @@ import { createLogger, setLogLevel } from "./logger.js";
 import { patchOnce } from "./patching.js";
 
 const logger = createLogger("tokenizer");
+const UNKNOWN_LOG_VALUE = "unknown";
 
-/** Logs, at debug, a locally served request with its model and token count. */
-function logSuccess(op, model, tokenCount) {
-	logger.debug(`${op} ok: "${model || "unknown"}" → ${tokenCount} tokens.`);
+function logString(value) {
+	return JSON.stringify(String(value || UNKNOWN_LOG_VALUE));
 }
 
-/**
- * Logs, at debug, that a request was delegated to SillyTavern's backend.
- *
- * Unsupported models fall through to the original path by design; this makes the
- * reason visible when debug is enabled, without affecting the info stream.
- */
-function logFallback(op, model, error = null) {
-	const modelName =
-		typeof error?.model_name === "string" && error.model_name
-			? error.model_name
-			: model;
-	const provider =
-		typeof error?.provider === "string" && error.provider
-			? `; provider=${error.provider}`
-			: "";
-	const reason = error?.message ? `: ${error.message}` : "";
-	logger.debug(
-		`"${modelName || "unknown"}" not handled locally (${op}${provider}); using backend${reason}.`,
+function stringField(value, field) {
+	return value &&
+		typeof value === "object" &&
+		typeof value[field] === "string"
+		? value[field]
+		: "";
+}
+
+function logModelName(model, payload = null) {
+	return stringField(payload, "model_name") || model || UNKNOWN_LOG_VALUE;
+}
+
+function logProvider(payload = null, fallbackProvider = "") {
+	return (
+		stringField(payload, "label") ||
+		stringField(payload, "provider") ||
+		fallbackProvider ||
+		UNKNOWN_LOG_VALUE
 	);
+}
+
+function logTokenResult(op, payload) {
+	const tokenCount =
+		typeof payload === "number"
+			? payload
+			: op === "encode"
+				? payload?.count
+				: payload?.token_count;
+
+	return Number.isFinite(tokenCount) ? `${tokenCount} tokens` : UNKNOWN_LOG_VALUE;
+}
+
+/** Logs a completed local tokenizer request. */
+function logSuccess(path, op, model, payload) {
+	logger.info(
+		`${op} success: path=${path}; model=${logString(logModelName(model, payload))}; provider=${logProvider(payload)}; result=${logTokenResult(op, payload)}.`,
+	);
+}
+
+/** Logs why the local tokenizer could not handle a request. */
+function logFailure(path, op, model, error = null, reasonOverride = "", level = "info") {
+	const reason = reasonOverride || error?.message || "";
+	const detail = reason ? `; reason=${logString(reason)}` : "";
+	logger[level](
+		`${op} failure: path=${path}; model=${logString(logModelName(model, error))}; provider=${logProvider(error)}${detail}.`,
+	);
+}
+
+/** Logs a completed backend fallback request. */
+function logFallback(path, op, model, payload, context = null) {
+	const provider = logProvider(payload, logProvider(context, ""));
+	logger.info(
+		`${op} fallback: path=${path}; model=${logString(logModelName(model, payload))}; provider=${provider}; result=${logTokenResult(op, payload)}.`,
+	);
+}
+
+function observeAjaxFallback(jqXHR, { op, model, error }) {
+	if (!jqXHR || typeof jqXHR.done !== "function") {
+		return;
+	}
+
+	jqXHR.done((payload) => {
+		logFallback("ajax", op, model, payload, error);
+	});
+
+	if (typeof jqXHR.fail === "function") {
+		jqXHR.fail((_jqXHR, textStatus, thrownError) => {
+			logFailure(
+				"ajax",
+				op,
+				model,
+				error,
+				`backend fallback failed: ${thrownError?.message || thrownError || textStatus}`,
+				"warn",
+			);
+		});
+	}
+}
+
+async function countWithBackendFallback(
+	originalCountAsync,
+	tokenHandler,
+	messages,
+	full,
+	type,
+	model,
+	error,
+) {
+	try {
+		const tokenCount = await originalCountAsync.call(
+			tokenHandler,
+			messages,
+			full,
+			type,
+		);
+		logFallback("fast-path", "count", model, tokenCount, error);
+		return tokenCount;
+	} catch (fallbackError) {
+		logFailure(
+			"fast-path",
+			"count",
+			model,
+			error,
+			`backend fallback failed: ${fallbackError?.message || fallbackError}`,
+			"warn",
+		);
+		throw fallbackError;
+	}
 }
 
 function makeTokenizerError(errorName, message, modelName = "", provider = "") {
@@ -247,15 +336,19 @@ function countLocally(model, bodyText) {
  * Count only returns an error while a provider-backed tokenizer is still loading.
  * Encode can also error when no local encoder can produce ids/chunks for a model.
  */
-function serveTokenizerLocally({ op, model }, bodyText) {
+function serveTokenizerLocally({ op, model }, bodyText, path) {
 	if (op === "encode") {
 		const payload = encodeLocally(model, bodyText);
-		if (!isTokenizerError(payload)) logSuccess("encode", model, payload.count);
+		if (!isTokenizerError(payload)) {
+			logSuccess(path, "encode", model, payload);
+		}
 		return payload;
 	}
 
 	const payload = countLocally(model, bodyText);
-	if (!isTokenizerError(payload)) logSuccess("count", model, payload.token_count);
+	if (!isTokenizerError(payload)) {
+		logSuccess(path, "count", model, payload);
+	}
 	return payload;
 }
 
@@ -297,18 +390,24 @@ function installAjaxInterceptor() {
 		const originalAjax = $.ajax;
 
 		$.ajax = function stDotToolboxAjax(options, settings) {
+			let fallback = null;
 			try {
 				const request = getAjaxRequest(options, settings);
 				const parsed = request?.url
 					? parseTokenizerRequest(request.url, request.type ?? request.method)
 					: null;
 				if (parsed) {
-					const payload = serveTokenizerLocally(parsed, readAjaxBody(request));
+					const payload = serveTokenizerLocally(
+						parsed,
+						readAjaxBody(request),
+						"ajax",
+					);
 					if (isTokenizerError(payload)) {
 						if (isUninitializedTokenizerError(payload)) {
 							warmTokenizerProviderFromError(payload);
 						}
-						logFallback(parsed.op, parsed.model, payload);
+						logFailure("ajax", parsed.op, parsed.model, payload);
+						fallback = { op: parsed.op, model: parsed.model, error: payload };
 					} else {
 						return resolveAjaxLocally($, request, payload);
 					}
@@ -320,7 +419,9 @@ function installAjaxInterceptor() {
 				);
 			}
 
-			return originalAjax.apply(this, arguments);
+			const jqXHR = originalAjax.apply(this, arguments);
+			if (fallback) observeAjaxFallback(jqXHR, fallback);
+			return jqXHR;
 		};
 
 		return { originalAjax };
@@ -345,8 +446,9 @@ async function installTokenHandlerFastPath() {
 				// which performs its own counting and bookkeeping.
 				TokenHandler.prototype.countAsync =
 					async function stDotToolboxCountAsync(messages, full, type) {
+						let model = "";
 						try {
-							const model = getTokenizerModel();
+							model = getTokenizerModel();
 							const messagesArray = Array.isArray(messages)
 								? messages
 								: [messages];
@@ -361,12 +463,20 @@ async function installTokenHandlerFastPath() {
 								if (isUninitializedTokenizerError(payload)) {
 									warmTokenizerProviderFromError(payload);
 								}
-								logFallback("count", model, payload);
-								return originalCountAsync.call(this, messages, full, type);
+								logFailure("fast-path", "count", model, payload);
+								return countWithBackendFallback(
+									originalCountAsync,
+									this,
+									messages,
+									full,
+									type,
+									model,
+									payload,
+								);
 							}
 
 							const { token_count } = payload;
-							logSuccess("count", model, token_count);
+							logSuccess("fast-path", "count", model, payload);
 
 							// ST often calls countAsync without a bucket type. The original method
 							// creates a NaN `undefined` bucket; skip that bookkeeping noise here.
@@ -376,11 +486,21 @@ async function installTokenHandlerFastPath() {
 
 							return token_count;
 						} catch (error) {
-							logger.error(
-								"TokenHandler.prototype.countAsync failed, falling back:",
-								error,
+							const fallbackError = makeTokenizerError(
+								"JavaScript",
+								error?.message || String(error),
+								model,
 							);
-							return originalCountAsync.call(this, messages, full, type);
+							logFailure("fast-path", "count", model, fallbackError, "", "warn");
+							return countWithBackendFallback(
+								originalCountAsync,
+								this,
+								messages,
+								full,
+								type,
+								model,
+								fallbackError,
+							);
 						}
 					};
 
