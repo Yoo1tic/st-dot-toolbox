@@ -9,8 +9,16 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = "1.0"
+flate2 = { version = "1.1", default-features = false, features = [
+  "rust_backend",
+] }
+minijinja = "2.21"
+minijinja-contrib = { version = "2.21", default-features = false, features = [
+  "pycompat",
+] }
 serde.workspace = true
 serde_json.workspace = true
+tar = { version = "0.4", default-features = false }
 thiserror.workspace = true
 tiktoken-rs = "0.12"
 tokenizers = { version = "0.23", default-features = false, features = [

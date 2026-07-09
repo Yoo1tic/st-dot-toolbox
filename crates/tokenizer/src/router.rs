@@ -11,20 +11,20 @@ use crate::{
 };
 
 /// Tokenizer implementation selected from a model name.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum TokenizerProvider {
     /// OpenAI-compatible tokenizer served by `tiktoken-rs`.
     OpenAi(OpenAiTokenizer),
     /// Gemma/Gemini-family tokenizer served by Hugging Face `tokenizers`.
-    Gemma(GemmaTokenizer),
+    Gemma(Option<&'static GemmaTokenizer>),
 }
 
 impl TokenizerProvider {
     /// Derives a tokenizer provider directly from a model name.
     pub fn from_model_name(model: &ModelName) -> Option<Self> {
         let model = model.as_str();
-        if let Some(tokenizer) = GemmaTokenizer::from_model_name(model) {
-            return Some(Self::Gemma(tokenizer));
+        if GemmaTokenizer::supports_model(model) {
+            return Some(Self::Gemma(GemmaTokenizer::from_model_name(model)));
         }
 
         OpenAiTokenizer::from_model_name(model).map(Self::OpenAi)
@@ -37,7 +37,11 @@ impl TokenizerProvider {
     ) -> Result<CountResult, TokenizerError> {
         match self {
             Self::OpenAi(tokenizer) => tokenizer.count(model, messages),
-            Self::Gemma(tokenizer) => tokenizer.count(model, messages),
+            Self::Gemma(Some(tokenizer)) => tokenizer.count(model, messages),
+            Self::Gemma(None) => Err(TokenizerError::UnInitialized {
+                model_name: model,
+                provider: GemmaTokenizer::LABEL.as_str(),
+            }),
         }
     }
 
@@ -48,7 +52,11 @@ impl TokenizerProvider {
     ) -> Result<EncodeResult, TokenizerError> {
         match self {
             Self::OpenAi(tokenizer) => tokenizer.encode(model, text),
-            Self::Gemma(tokenizer) => tokenizer.encode(model, text),
+            Self::Gemma(Some(tokenizer)) => tokenizer.encode(model, text),
+            Self::Gemma(None) => Err(TokenizerError::UnInitialized {
+                model_name: model,
+                provider: GemmaTokenizer::LABEL.as_str(),
+            }),
         }
     }
 
@@ -56,7 +64,11 @@ impl TokenizerProvider {
     pub fn decode(&self, model: ModelName, ids: &[u32]) -> Result<DecodeResult, TokenizerError> {
         match self {
             Self::OpenAi(tokenizer) => tokenizer.decode(model, ids),
-            Self::Gemma(tokenizer) => tokenizer.decode(model, ids),
+            Self::Gemma(Some(tokenizer)) => tokenizer.decode(model, ids),
+            Self::Gemma(None) => Err(TokenizerError::Unsupported(format!(
+                "model `{}` is not handled by the local decoder",
+                model.as_str()
+            ))),
         }
     }
 }

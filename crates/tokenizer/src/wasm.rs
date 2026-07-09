@@ -63,9 +63,9 @@ pub fn st_dot_token_handler_count_async_wasm(
 #[wasm_bindgen(js_name = st_dot_init_tokenizer_provider)]
 pub fn st_dot_init_tokenizer_provider_wasm(
     provider: &str,
-    tokenizer_json: &str,
+    bundle_tar_gz: &[u8],
 ) -> Result<(), JsError> {
-    crate::init_tokenizer_provider(provider, tokenizer_json)
+    crate::init_tokenizer_provider(provider, bundle_tar_gz)
         .map_err(|error| JsError::new(&error.to_string()))
 }
 

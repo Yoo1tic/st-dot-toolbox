@@ -12,65 +12,80 @@ import { patchOnce } from "./patching.js";
 const logger = createLogger("tokenizer");
 const UNKNOWN_LOG_VALUE = "unknown";
 
-function logString(value) {
-	return JSON.stringify(String(value || UNKNOWN_LOG_VALUE));
-}
+// --- Logging & Formatting Helpers ---
 
-function stringField(value, field) {
-	return value &&
-		typeof value === "object" &&
-		typeof value[field] === "string"
-		? value[field]
-		: "";
-}
+const formatValue = (value) => (value ? `'${value}'` : UNKNOWN_LOG_VALUE);
+const stringField = (obj, key) =>
+	typeof obj?.[key] === "string" ? obj[key] : "";
 
-function logModelName(model, payload = null) {
-	return stringField(payload, "model_name") || model || UNKNOWN_LOG_VALUE;
-}
+const getModel = (model, payload) =>
+	stringField(payload, "model_name") || model || UNKNOWN_LOG_VALUE;
+const getProvider = (payload, fallback = UNKNOWN_LOG_VALUE) =>
+	stringField(payload, "label") || stringField(payload, "provider") || fallback;
 
-function logProvider(payload = null, fallbackProvider = "") {
-	return (
-		stringField(payload, "label") ||
-		stringField(payload, "provider") ||
-		fallbackProvider ||
-		UNKNOWN_LOG_VALUE
-	);
-}
-
-function logTokenResult(op, payload) {
-	const tokenCount =
-		typeof payload === "number"
-			? payload
-			: op === "encode"
-				? payload?.count
-				: payload?.token_count;
-
-	return Number.isFinite(tokenCount) ? `${tokenCount} tokens` : UNKNOWN_LOG_VALUE;
+function getTokens(op, payload) {
+	let count;
+	if (typeof payload === "number") {
+		count = payload;
+	} else if (op === "encode") {
+		count = payload?.count;
+	} else {
+		count = payload?.token_count;
+	}
+	return Number.isFinite(count) ? `${count} tokens` : UNKNOWN_LOG_VALUE;
 }
 
 /** Logs a completed local tokenizer request. */
 function logSuccess(path, op, model, payload) {
 	logger.info(
-		`${op} success: path=${path}; model=${logString(logModelName(model, payload))}; provider=${logProvider(payload)}; result=${logTokenResult(op, payload)}.`,
+		`${op} success: path=${path}; model=${formatValue(getModel(model, payload))}; provider=${getProvider(payload)}; result=${getTokens(op, payload)}.`,
 	);
 }
 
 /** Logs why the local tokenizer could not handle a request. */
-function logFailure(path, op, model, error = null, reasonOverride = "", level = "info") {
+function logFailure(
+	path,
+	op,
+	model,
+	error = null,
+	reasonOverride = "",
+	level = "info",
+) {
 	const reason = reasonOverride || error?.message || "";
-	const detail = reason ? `; reason=${logString(reason)}` : "";
+	const detail = reason ? `; reason=${formatValue(reason)}` : "";
 	logger[level](
-		`${op} failure: path=${path}; model=${logString(logModelName(model, error))}; provider=${logProvider(error)}${detail}.`,
+		`${op} failure: path=${path}; model=${formatValue(getModel(model, error))}; provider=${getProvider(error)}${detail}.`,
 	);
 }
 
 /** Logs a completed backend fallback request. */
 function logFallback(path, op, model, payload, context = null) {
-	const provider = logProvider(payload, logProvider(context, ""));
 	logger.info(
-		`${op} fallback: path=${path}; model=${logString(logModelName(model, payload))}; provider=${provider}; result=${logTokenResult(op, payload)}.`,
+		`${op} fallback: path=${path}; model=${formatValue(getModel(model, payload))}; provider=${getProvider(payload, getProvider(context))}; result=${getTokens(op, payload)}.`,
 	);
 }
+
+// --- Local Result Processing Pipeline ---
+
+/**
+ * Evaluates a local tokenizer result, triggers warmup if the provider is uninitialized,
+ * and records success or failure logs.
+ *
+ * @returns {{ isError: boolean, error?: any, payload?: any }} Unified result status.
+ */
+function processLocalResult(payload, op, model, path) {
+	if (isTokenizerError(payload)) {
+		if (isUninitializedTokenizerError(payload)) {
+			warmTokenizerProviderFromError(payload);
+		}
+		logFailure(path, op, model, payload);
+		return { isError: true, error: payload };
+	}
+	logSuccess(path, op, model, payload);
+	return { isError: false, payload };
+}
+
+// --- Ajax & Fallback Logic ---
 
 function observeAjaxFallback(jqXHR, { op, model, error }) {
 	if (!jqXHR || typeof jqXHR.done !== "function") {
@@ -125,6 +140,8 @@ async function countWithBackendFallback(
 		throw fallbackError;
 	}
 }
+
+// --- Error Type Guards ---
 
 function makeTokenizerError(errorName, message, modelName = "", provider = "") {
 	return { error: errorName, message, model_name: modelName, provider };
@@ -235,7 +252,7 @@ function parseTokenizerRequest(rawUrl, method) {
 }
 
 const TOKENIZER_PROVIDER_ASSET_URLS = Object.freeze({
-	gemma: new URL("../assets/gemma/tokenizer.json.gz", import.meta.url),
+	gemma: new URL("../assets/gemma/gemma.tar.gz", import.meta.url),
 });
 const tokenizerProviderPromises = new Map();
 
@@ -245,38 +262,34 @@ function tokenizerProviderAssetUrl(provider) {
 	return url;
 }
 
-async function fetchCompressedTokenizerJson(provider) {
+async function fetchTokenizerProviderBundle(provider) {
 	const response = await fetch(tokenizerProviderAssetUrl(provider), {
 		cache: "force-cache",
 	});
 	if (!response.ok) {
 		throw new Error(
-			`failed to fetch compressed tokenizer provider ${provider}: ${response.status} ${response.statusText}`,
+			`failed to fetch tokenizer provider bundle ${provider}: ${response.status} ${response.statusText}`,
 		);
 	}
-	if (!response.body || typeof DecompressionStream !== "function") {
-		throw new Error("gzip decompression is not supported by this browser");
-	}
-
-	const stream = response.body.pipeThrough(new DecompressionStream("gzip"));
-	return new Response(stream).text();
+	return new Uint8Array(await response.arrayBuffer());
 }
 
-function ensureTokenizerProvider(provider) {
+async function ensureTokenizerProvider(provider) {
 	if (!provider) return false;
 
 	if (!tokenizerProviderPromises.has(provider)) {
-		const promise = fetchCompressedTokenizerJson(provider)
-			.then((tokenizerJson) => {
-				st_dot_init_tokenizer_provider(provider, tokenizerJson);
+		const loadProvider = async () => {
+			try {
+				const bundle = await fetchTokenizerProviderBundle(provider);
+				st_dot_init_tokenizer_provider(provider, bundle);
 				logger.info(`tokenizer provider initialized: ${provider}.`);
 				return true;
-			})
-			.catch((error) => {
+			} catch (error) {
 				tokenizerProviderPromises.delete(provider);
 				throw error;
-			});
-		tokenizerProviderPromises.set(provider, promise);
+			}
+		};
+		tokenizerProviderPromises.set(provider, loadProvider());
 	}
 
 	return tokenizerProviderPromises.get(provider);
@@ -322,34 +335,18 @@ function countLocally(model, bodyText) {
 	} catch (error) {
 		return makeTokenizerError("Json", error.message, model);
 	}
-	if (!Array.isArray(messages)) {
-		messages = [messages];
-	}
-
-	return st_dot_get_token_count_async(model, messages);
+	const messagesArray = Array.isArray(messages) ? messages : [messages];
+	return st_dot_get_token_count_async(model, messagesArray);
 }
 
 /**
  * Serves a classified tokenizer request locally, returning either a success
  * payload or a structured tokenizer error.
- *
- * Count only returns an error while a provider-backed tokenizer is still loading.
- * Encode can also error when no local encoder can produce ids/chunks for a model.
  */
-function serveTokenizerLocally({ op, model }, bodyText, path) {
-	if (op === "encode") {
-		const payload = encodeLocally(model, bodyText);
-		if (!isTokenizerError(payload)) {
-			logSuccess(path, "encode", model, payload);
-		}
-		return payload;
-	}
-
-	const payload = countLocally(model, bodyText);
-	if (!isTokenizerError(payload)) {
-		logSuccess(path, "count", model, payload);
-	}
-	return payload;
+function serveTokenizerLocally({ op, model }, bodyText) {
+	return op === "encode"
+		? encodeLocally(model, bodyText)
+		: countLocally(model, bodyText);
 }
 
 function getAjaxRequest(options, settings) {
@@ -377,9 +374,6 @@ function resolveAjaxLocally($, request, payload) {
 }
 
 function installAjaxInterceptor() {
-	// Both `getTextTokens` (encode) and `getTokenCountAsync` (count) reach the
-	// server exclusively through `jQuery.ajax`, so one `$.ajax` patch covers every
-	// encode and count request regardless of which SillyTavern caller issued it.
 	if (!window.jQuery) {
 		logger.warn("jQuery unavailable; tokenizer requests will use the backend.");
 		return;
@@ -397,19 +391,21 @@ function installAjaxInterceptor() {
 					? parseTokenizerRequest(request.url, request.type ?? request.method)
 					: null;
 				if (parsed) {
-					const payload = serveTokenizerLocally(
-						parsed,
-						readAjaxBody(request),
+					const payload = serveTokenizerLocally(parsed, readAjaxBody(request));
+					const result = processLocalResult(
+						payload,
+						parsed.op,
+						parsed.model,
 						"ajax",
 					);
-					if (isTokenizerError(payload)) {
-						if (isUninitializedTokenizerError(payload)) {
-							warmTokenizerProviderFromError(payload);
-						}
-						logFailure("ajax", parsed.op, parsed.model, payload);
-						fallback = { op: parsed.op, model: parsed.model, error: payload };
+					if (result.isError) {
+						fallback = {
+							op: parsed.op,
+							model: parsed.model,
+							error: result.error,
+						};
 					} else {
-						return resolveAjaxLocally($, request, payload);
+						return resolveAjaxLocally($, request, result.payload);
 					}
 				}
 			} catch (error) {
@@ -441,9 +437,6 @@ async function installTokenHandlerFastPath() {
 			() => {
 				const originalCountAsync = TokenHandler.prototype.countAsync;
 
-				// Direct hot path for prompt construction. The WASM branch must also
-				// update `this.counts[type]`; fallback delegates to the original method,
-				// which performs its own counting and bookkeeping.
 				TokenHandler.prototype.countAsync =
 					async function stDotToolboxCountAsync(messages, full, type) {
 						let model = "";
@@ -453,17 +446,17 @@ async function installTokenHandlerFastPath() {
 								? messages
 								: [messages];
 
-							// Pass live message objects straight to Rust; the WASM
-							// boundary deserializes them without a JSON string hop.
 							const payload = st_dot_token_handler_count_async(
 								model,
 								messagesArray,
 							);
-							if (isTokenizerError(payload)) {
-								if (isUninitializedTokenizerError(payload)) {
-									warmTokenizerProviderFromError(payload);
-								}
-								logFailure("fast-path", "count", model, payload);
+							const result = processLocalResult(
+								payload,
+								"count",
+								model,
+								"fast-path",
+							);
+							if (result.isError) {
 								return countWithBackendFallback(
 									originalCountAsync,
 									this,
@@ -471,15 +464,11 @@ async function installTokenHandlerFastPath() {
 									full,
 									type,
 									model,
-									payload,
+									result.error,
 								);
 							}
 
-							const { token_count } = payload;
-							logSuccess("fast-path", "count", model, payload);
-
-							// ST often calls countAsync without a bucket type. The original method
-							// creates a NaN `undefined` bucket; skip that bookkeeping noise here.
+							const { token_count } = result.payload;
 							if (type) {
 								this.counts[type] += token_count;
 							}
@@ -491,7 +480,14 @@ async function installTokenHandlerFastPath() {
 								error?.message || String(error),
 								model,
 							);
-							logFailure("fast-path", "count", model, fallbackError, "", "warn");
+							logFailure(
+								"fast-path",
+								"count",
+								model,
+								fallbackError,
+								"",
+								"warn",
+							);
 							return countWithBackendFallback(
 								originalCountAsync,
 								this,

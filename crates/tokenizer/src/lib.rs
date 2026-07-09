@@ -176,9 +176,9 @@ pub fn try_encode_request(
 }
 
 /// Initializes the tokenizer data for a provider requested by Rust.
-pub fn init_tokenizer_provider(provider: &str, tokenizer_json: &str) -> Result<(), TokenizerError> {
+pub fn init_tokenizer_provider(provider: &str, bundle_tar_gz: &[u8]) -> Result<(), TokenizerError> {
     if provider == <GemmaTokenizer as Tokenizer>::LABEL.as_str() {
-        return google::gemma::init_tokenizer(tokenizer_json);
+        return google::gemma::init_tokenizer_bundle(bundle_tar_gz);
     }
 
     Err(TokenizerError::Unsupported(format!(
@@ -240,7 +240,7 @@ mod tests {
             openai.decode(model("gpt-4o"), &[1, 2, 3]),
             Err(TokenizerError::Unsupported(_))
         ));
-        let gemma = GemmaTokenizer::from_model_name("gemini")
+        let gemma = TokenizerProvider::from_model_name(&model("gemini"))
             .ok_or_else(|| "gemini should resolve".to_string())?;
         assert!(matches!(
             gemma.decode(model("gemini"), &[1, 2, 3]),
