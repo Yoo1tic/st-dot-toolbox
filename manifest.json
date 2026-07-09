@@ -1,0 +1,10 @@
+{
+  "display_name": "ST Dot Toolbox",
+  "loading_order": 5,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "author": "Yoo1tic",
+  "version": "0.1.0",
+  "homePage": "https://github.com/Yoo1tic/st-dot-toolbox"
+}
